@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 import time
-import serial
 import threading
 import queue
 from flask import Flask, Response, render_template_string, jsonify, request
@@ -10,7 +9,7 @@ import logging
 import json
 import os
 from tflite_runtime.interpreter import Interpreter
-from adafruit_servokit import ServoKit
+from gpiozero import AngularServo
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -33,13 +32,12 @@ INPUT_WIDTH = 224
 INPUT_HEIGHT = 224
 CONFIDENCE_THRESHOLD = 0.85 # Adjusted slightly for averaged results
 
-NUM_SERVOS = 4
+NUM_SERVOS = 1
 DEFAULT_SERVO_ANGLES = {
-    'Battery': [90, 90, 90, 180],
-    'PCB':     [90, 90, 0, 90],
-    'metal':   [0, 90, 90, 90],
-    'plastic': [90, 180, 90, 90], 
-    'default': [90, 90, 90, 90],
+    'paper': 180,
+    'plastic': 90,
+    'metal': 0,
+    'default': 90,
 }
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'servo_config.json')
@@ -48,7 +46,9 @@ def load_servo_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data.get('default'), int):
+                    return data
         except Exception as e:
             log.error(f"Error loading servo config: {e}")
     try:
@@ -67,8 +67,6 @@ def save_servo_config():
 
 SERVO_ANGLES = load_servo_config()
 
-SERIAL_PORT = '/dev/ttyUSB0' 
-BAUD_RATE = 9600
 # --- END CONFIGURATION ---
 
 # --- GLOBAL STATE ---
@@ -108,35 +106,23 @@ def center_crop_and_resize(frame, size=(224, 224)):
     cropped = frame[start_y:start_y+min_dim, start_x:start_x+min_dim]
     return cv2.resize(cropped, size)
 
-def set_servos(kit, angles):
-    """Move all servos to the given angles. Emits a WebSocket alert on failure."""
-    if kit is None:
-        log.error("set_servos called but ServoKit is not initialized.")
+def set_servos(servo, angle):
+    """Move the servo to the given angle. Emits a WebSocket alert on failure."""
+    if servo is None:
+        log.error("set_servos called but Servo is not initialized.")
         socketio.emit('hardware_error', {'msg': 'Servo not initialized!'})
         return
     try:
-        for i in range(NUM_SERVOS):
-            kit.servo[i].angle = angles[i]
-            time.sleep(0.05)  # Allow each servo time to physically move
-        log.info(f"Servos moved to: {angles}")
+        # gpiozero AngularServo expects angles between minimum_angle and maximum_angle
+        # If we configure it with min=-90, max=90, then to move 0-180 we shift by 90
+        # Wait, easiest is to initialize it with min_angle=0, max_angle=180
+        servo.angle = angle
+        time.sleep(0.5)  # Allow servo time to physically move
+        log.info(f"Servo moved to: {angle}")
     except Exception as e:
         log.error(f"Servo failure: {e}")
         socketio.emit('hardware_error', {'msg': f'Servo failure: {e}'})
         raise
-
-def send_to_lcd(ser, line1, line2=""):
-    """Send two lines to the LCD over serial. Warns if text is truncated."""
-    if ser is None:
-        return
-    try:
-        if len(line1) > 16:
-            log.warning(f"LCD line1 truncated: '{line1}'")
-        if len(line2) > 16:
-            log.warning(f"LCD line2 truncated: '{line2}'")
-        message = f"{line1[:16]}|{line2[:16]}\n"
-        ser.write(message.encode('utf-8'))
-    except Exception as e:
-        log.error(f"LCD serial error: {e}")
 
 def capture_n_distinct_frames(buffer, n=3, timeout=2.0):
     """
@@ -163,24 +149,17 @@ def capture_n_distinct_frames(buffer, n=3, timeout=2.0):
 
 def inference_worker():
     log.info("[Thread] Inference Worker started.")
-    kit = None
-    ser = None
+    servo = None
     interpreter = None
     labels = []
 
     try:
-        kit = ServoKit(channels=16)
-        log.info("ServoKit initialized.")
+        # Initialize an AngularServo on a specific GPIO pin (e.g., GPIO17).
+        # You may need to change the pin number depending on your hardware setup.
+        servo = AngularServo(17, min_angle=0, max_angle=180, min_pulse_width=0.0005, max_pulse_width=0.0025)
+        log.info("Servo initialized on GPIO 17.")
     except Exception as e:
-        log.warning(f"ServoKit init failed: {e}")
-
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        time.sleep(2)
-        send_to_lcd(ser, "System Ready", "Web Connected")
-        log.info("Serial/LCD initialized.")
-    except Exception as e:
-        log.warning(f"Serial/LCD init failed: {e}")
+        log.warning(f"Servo init failed: {e}")
 
     try:
         labels = load_labels(LABEL_PATH)
@@ -192,8 +171,8 @@ def inference_worker():
     except Exception as e:
         log.critical(f"Model loading failed: {e}")
 
-    if kit:
-        set_servos(kit, SERVO_ANGLES['default'])
+    if servo:
+        set_servos(servo, SERVO_ANGLES['default'])
 
     while True:
         command, _, response_queue = task_queue.get()
@@ -234,7 +213,6 @@ def inference_worker():
 
                 if confidence > CONFIDENCE_THRESHOLD:
                     result_text = f"{class_name} ({confidence:.0%})"
-                    send_to_lcd(ser, f"Found: {class_name}", f"Conf:{confidence:.0%}")
                     socketio.emit('sort_result', {
                         'result': result_text,
                         'class': class_name,
@@ -242,14 +220,12 @@ def inference_worker():
                     })
 
                     if class_name in SERVO_ANGLES:
-                        set_servos(kit, SERVO_ANGLES[class_name])
+                        set_servos(servo, SERVO_ANGLES[class_name])
                         time.sleep(1.5)           # Wait for object to physically drop/slide
-                        set_servos(kit, SERVO_ANGLES['default'])   # Auto-reset
-                        send_to_lcd(ser, "Ready", "Next object?")
+                        set_servos(servo, SERVO_ANGLES['default'])   # Auto-reset
                         log.info("Servos auto-reset to default after sort.")
                 else:
                     result_text = "Low Confidence — Try Again"
-                    send_to_lcd(ser, "Low Confidence", "Try Again")
                     socketio.emit('sort_result', {'result': result_text, 'class': None, 'confidence': confidence})
                     log.warning(f"Low confidence: {class_name} at {confidence:.0%}")
             else:
@@ -261,9 +237,8 @@ def inference_worker():
                 response_queue.put(result_text)
 
         elif command == 'RESET':
-            if kit:
-                set_servos(kit, SERVO_ANGLES['default'])
-            send_to_lcd(ser, "Status: Ready", "Waiting...")
+            if servo:
+                set_servos(servo, SERVO_ANGLES['default'])
             socketio.emit('sort_result', {'result': 'System Reset ✅', 'class': None, 'confidence': 0})
             log.info("Manual reset triggered.")
             if response_queue:
@@ -345,10 +320,7 @@ HTML_TEMPLATE = """
                 <thead>
                     <tr>
                         <th>Waste Type</th>
-                        <th>Servo 1</th>
-                        <th>Servo 2</th>
-                        <th>Servo 3</th>
-                        <th>Servo 4</th>
+                        <th>Servo Angle</th>
                     </tr>
                 </thead>
                 <tbody id="configTableBody">
@@ -406,11 +378,9 @@ HTML_TEMPLATE = """
                 .then(data => {
                     const tbody = document.getElementById('configTableBody');
                     tbody.innerHTML = '';
-                    for (const [key, angles] of Object.entries(data)) {
+                    for (const [key, angle] of Object.entries(data)) {
                         let html = `<tr><td>${key}</td>`;
-                        for (let i = 0; i < 4; i++) {
-                            html += `<td><input type="number" min="0" max="180" step="1" value="${angles[i]}"></td>`;
-                        }
+                        html += `<td><input type="number" min="0" max="180" step="1" value="${angle}"></td>`;
                         html += `</tr>`;
                         tbody.innerHTML += html;
                     }
@@ -428,12 +398,8 @@ HTML_TEMPLATE = """
             for (let row of rows) {
                 const cells = row.getElementsByTagName('td');
                 const key = cells[0].innerText;
-                const angles = [];
-                for (let i = 1; i <= 4; i++) {
-                    const input = cells[i].getElementsByTagName('input')[0];
-                    angles.push(parseInt(input.value));
-                }
-                newConfig[key] = angles;
+                const input = cells[1].getElementsByTagName('input')[0];
+                newConfig[key] = parseInt(input.value);
             }
 
             fetch('/api/servo_config', {
@@ -489,11 +455,8 @@ def api_servo_config():
             return jsonify({"error": "Invalid JSON format"}), 400
         
         for k, v in data.items():
-            if not isinstance(v, list) or len(v) != 4:
-                return jsonify({"error": f"Value for '{k}' must be a list of 4 integers"}), 400
-            for val in v:
-                if not isinstance(val, int) or val < 0 or val > 180:
-                    return jsonify({"error": f"Values must be integers between 0 and 180 (got {val})"}), 400
+            if not isinstance(v, int) or v < 0 or v > 180:
+                return jsonify({"error": f"Value for '{k}' must be an int between 0 and 180"}), 400
         
         SERVO_ANGLES.update(data)
         save_servo_config()
